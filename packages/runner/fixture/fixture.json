@@ -1,0 +1,6 @@
+{
+  "kind": "faultline-controlled-reference",
+  "version": 1,
+  "services": ["checkout", "inventory", "payments"],
+  "description": "Disposable local HTTP services. Test money and inventory only."
+}
