@@ -1,4 +1,9 @@
 import { createServer } from 'node:http';
+import { timingSafeEqual } from 'node:crypto';
+
+const token = process.env.FAULTLINE_FIXTURE_TOKEN;
+if (!/^[a-f0-9]{64}$/.test(token || '')) throw new Error('A fixture capability token is required');
+const authorization = Buffer.from(`Bearer ${token}`);
 
 export async function readBody(request) {
   let body = '';
@@ -6,7 +11,8 @@ export async function readBody(request) {
     body += chunk;
     if (body.length > 4096) throw new Error('Request body too large');
   }
-  const value = JSON.parse(body);
+  let value;
+  try { value = JSON.parse(body); } catch { throw new Error('Invalid JSON body'); }
   if (!value || !/^order-\d{4}$/.test(value.orderId)) throw new Error('Invalid order ID');
   return value;
 }
@@ -18,6 +24,17 @@ export function json(response, status, value) {
 
 export function listen(handler) {
   const server = createServer((request, response) => {
+    const host = `127.0.0.1:${server.address().port}`;
+    if (request.headers.host !== host || (request.headers.origin !== undefined && request.headers.origin !== `http://${host}`)) {
+      return json(response, 403, { error: 'Forbidden request origin' });
+    }
+    const supplied = Buffer.from(request.headers.authorization || '');
+    if (supplied.length !== authorization.length || !timingSafeEqual(supplied, authorization)) {
+      return json(response, 403, { error: 'Fixture authorization required' });
+    }
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method) && request.headers['content-type']?.split(';')[0].trim().toLowerCase() !== 'application/json') {
+      return json(response, 415, { error: 'JSON content type required' });
+    }
     Promise.resolve(handler(request, response)).catch((error) => {
       if (!response.headersSent && !response.destroyed) json(response, 400, { error: error.message });
       else response.destroy();
@@ -38,7 +55,7 @@ export function listen(handler) {
 
 export async function postJson(url, value, timeout = 1500) {
   const response = await fetch(url, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
     body: JSON.stringify(value), signal: AbortSignal.timeout(timeout)
   });
   const result = await response.json();

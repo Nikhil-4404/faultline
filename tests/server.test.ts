@@ -1,6 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, readdir } from "node:fs/promises";
+import {
+  mkdtemp,
+  rm,
+  readdir,
+  mkdir,
+  writeFile,
+  readFile,
+  symlink,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { request } from "node:http";
@@ -62,7 +70,7 @@ test(
       );
       const address = app.server.address();
       assert.ok(address && typeof address === "object");
-      const url = `http://127.0.0.1:${address.port}`;
+      let url = `http://127.0.0.1:${address.port}`;
       const get = (route: string) => fetch(url + route);
       const post = (
         route: string,
@@ -208,7 +216,61 @@ test(
         events: [],
       };
       await runStore.put(interrupted);
+      const analysisStore = new RecordStore<AnalysisResult>(
+        join(dataDir, "analyses"),
+      );
+      await analysisStore.load();
+      const previousAnalysis: AnalysisResult = {
+        ...analysis,
+        id: "00000000-0000-0000-0000-000000000003",
+        repository: join(projectRoot, ".faultline", "previous-demo"),
+        experimentEligible: true,
+      };
+      await analysisStore.put(previousAnalysis);
+      const previousRun: ExperimentRun = {
+        ...run,
+        id: "00000000-0000-0000-0000-000000000004",
+        analysisId: previousAnalysis.id,
+      };
+      await runStore.put(previousRun);
+      const previousPath = join(
+        dataDir,
+        "analyses",
+        previousAnalysis.id + ".json",
+      );
+      const previousBytes = await readFile(previousPath, "utf8");
       app = await createApp({ projectRoot, dataDir, demo });
+      await new Promise<void>((done) =>
+        app!.server.listen(0, "127.0.0.1", done),
+      );
+      const restartedAddress = app.server.address();
+      assert.ok(restartedAddress && typeof restartedAddress === "object");
+      url = `http://127.0.0.1:${restartedAddress.port}`;
+      const listed = (await (
+        await get("/api/analyses")
+      ).json()) as AnalysisResult[];
+      assert.equal(
+        listed.find((item) => item.id === previousAnalysis.id)
+          ?.experimentEligible,
+        false,
+      );
+      assert.equal(
+        listed.find((item) => item.id === analysis.id)?.experimentEligible,
+        true,
+      );
+      const staleResponse = await post("/api/runs", {
+        analysisId: previousAnalysis.id,
+        scenario: "healthy",
+        requests: 5,
+      });
+      assert.equal(staleResponse.status, 422);
+      assert.match((await staleResponse.json()).error, /Reanalyze/);
+      const historical = await (
+        await get(`/api/runs/${previousRun.id}/export`)
+      ).json();
+      assert.deepEqual(historical.analysis, previousAnalysis);
+      assert.deepEqual(historical.run, previousRun);
+      assert.equal(await readFile(previousPath, "utf8"), previousBytes);
       const saved = new RecordStore<ExperimentRun>(join(dataDir, "runs"));
       await saved.load();
       assert.equal(saved.get(interrupted.id)?.status, "interrupted");
@@ -225,6 +287,63 @@ test(
     }
   },
 );
+
+test("static assets and SPA fallback reject canonical paths outside dist", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "faultline-api-"));
+  const dist = join(projectRoot, "dist");
+  const outside = join(projectRoot, "outside-assets");
+  let app: Awaited<ReturnType<typeof createApp>> | undefined;
+  try {
+    await Promise.all([mkdir(dist), mkdir(outside)]);
+    await Promise.all([
+      writeFile(join(dist, "index.html"), "<main>Dashboard fixture</main>"),
+      writeFile(join(dist, "asset.js"), "console.log('asset fixture');"),
+      writeFile(join(outside, "sentinel.txt"), "INERT_OUTSIDE_SENTINEL"),
+    ]);
+    await symlink(
+      outside,
+      join(dist, "escaped"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    app = await createApp({
+      projectRoot,
+      dataDir: join(projectRoot, ".faultline"),
+      demo: {
+        repository: projectRoot,
+        baseRef: "baseline",
+        headRef: "candidate",
+        name: "Static boundary fixture",
+        description: "Inert test fixture; no experiment execution.",
+      },
+    });
+    await new Promise<void>((done) =>
+      app!.server.listen(0, "127.0.0.1", done),
+    );
+    const address = app.server.address();
+    assert.ok(address && typeof address === "object");
+    const url = `http://127.0.0.1:${address.port}`;
+    const asset = await fetch(url + "/asset.js");
+    assert.equal(asset.status, 200);
+    assert.equal(await asset.text(), "console.log('asset fixture');");
+    const fallback = await fetch(url + "/workspace/history");
+    assert.equal(fallback.status, 200);
+    assert.equal(await fallback.text(), "<main>Dashboard fixture</main>");
+    assert.equal((await fetch(url + "/api/missing")).status, 404);
+    const escaped = await fetch(url + "/escaped/sentinel.txt");
+    assert.equal(escaped.status, 403);
+    assert.doesNotMatch(await escaped.text(), /INERT_OUTSIDE_SENTINEL/);
+    await rm(join(dist, "index.html"));
+    await symlink(
+      outside,
+      join(dist, "index.html"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    assert.equal((await fetch(url + "/workspace/history")).status, 403);
+  } finally {
+    await app?.shutdown();
+    await removeTestDirectory(projectRoot);
+  }
+});
 
 async function apiFixture() {
   const projectRoot = await mkdtemp(join(tmpdir(), "faultline-api-"));

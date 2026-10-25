@@ -4,7 +4,7 @@ import type { DemoProject } from "../../shared/src/index.ts";
 import { fixtureSources, git, verifiedSnapshot } from "./fixture.ts";
 
 export async function ensureDemo(projectRoot: string): Promise<DemoProject> {
-  const repository = join(resolve(projectRoot), ".faultline", "demo");
+  const repository = join(resolve(projectRoot), ".faultline", "demo-v2");
   await mkdir(dirname(repository), { recursive: true });
   let created = false;
   try {

@@ -34,6 +34,8 @@ interface Options {
 }
 const latest = <T extends { createdAt: string }>(records: T[]) =>
   records.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+const pathIdentity = (value: string) =>
+  process.platform === "win32" ? value.toLowerCase() : value;
 const json = (res: ServerResponse, status: number, value: unknown) => {
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
@@ -102,6 +104,11 @@ function trustedRequest(req: IncomingMessage, ports: number[]): void {
 
 export async function createApp(options: Options) {
   const demo = options.demo ?? (await ensureDemo(options.projectRoot));
+  const demoRepository = pathIdentity(await realpath(demo.repository));
+  const experimentEligible = (analysis: AnalysisResult) =>
+    pathIdentity(analysis.repository) === demoRepository &&
+    analysis.baseRef === demo.baseRef &&
+    analysis.headRef === demo.headRef;
   const analyses = new RecordStore<AnalysisResult>(
     join(options.dataDir, "analyses"),
   );
@@ -238,7 +245,14 @@ export async function createApp(options: Options) {
       if (path === "/api/scenarios" && method === "GET")
         return json(res, 200, SCENARIOS);
       if (path === "/api/analyses" && method === "GET")
-        return json(res, 200, latest(analyses.list()));
+        return json(
+          res,
+          200,
+          latest(analyses.list()).map((analysis) => ({
+            ...analysis,
+            experimentEligible: experimentEligible(analysis),
+          })),
+        );
       if (path === "/api/analyses" && method === "POST") {
         const input = await body(req);
         assertWritable();
@@ -262,13 +276,7 @@ export async function createApp(options: Options) {
             baseRef,
             headRef,
           });
-          const normalize = (value: string) =>
-            process.platform === "win32" ? value.toLowerCase() : value;
-          analysis.experimentEligible =
-            normalize(await realpath(repository)) ===
-              normalize(await realpath(demo.repository)) &&
-            baseRef === demo.baseRef &&
-            headRef === demo.headRef;
+          analysis.experimentEligible = experimentEligible(analysis);
           assertWritable();
           try {
             await analyses.put(analysis);
@@ -293,10 +301,10 @@ export async function createApp(options: Options) {
         const analysisId = textField(input.analysisId, "analysisId", 36);
         const analysis = analyses.get(analysisId);
         if (!analysis) throw new HttpError(404, "Analysis not found.");
-        if (!analysis.experimentEligible)
+        if (!experimentEligible(analysis))
           throw new HttpError(
             422,
-            "Only the bundled checkout reference application can execute experiments. External repositories support read-only analysis.",
+            "Only the current bundled checkout reference application can execute experiments. Reanalyze the current reference application; previous reference versions and external repositories remain read-only.",
           );
         const scenario = input.scenario;
         if (!SCENARIOS.some((value) => value.id === scenario))
@@ -396,9 +404,25 @@ export async function createApp(options: Options) {
       } catch {
         file = join(dist, "index.html");
       }
+      let canonicalDist: string;
+      let canonicalFile: string;
+      try {
+        canonicalDist = pathIdentity(await realpath(dist));
+        canonicalFile = await realpath(file);
+      } catch {
+        throw new HttpError(
+          503,
+          "Dashboard is not built. Run npm run build, then reload.",
+        );
+      }
+      if (
+        pathIdentity(canonicalFile) !== canonicalDist &&
+        !pathIdentity(canonicalFile).startsWith(canonicalDist + sep)
+      )
+        throw new HttpError(403, "Invalid asset path.");
       let bytes: Buffer;
       try {
-        bytes = await readFile(file);
+        bytes = await readFile(canonicalFile);
       } catch {
         throw new HttpError(
           503,

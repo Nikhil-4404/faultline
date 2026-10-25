@@ -8,6 +8,7 @@ import {
   writeFile,
   rm,
   readFile,
+  readdir,
   rename,
 } from "node:fs/promises";
 import path from "node:path";
@@ -263,6 +264,64 @@ test("identical commits produce no changed symbols, impacts, or failure suggesti
     await f.cleanup();
   }
 });
+
+test(
+  "missing promised blobs fail offline without changing repository state",
+  { timeout: 10_000 },
+  async () => {
+    const f = await fixture({ "index.ts": "export const value = 1;\n" });
+    const previous = process.env.GIT_NO_LAZY_FETCH;
+    try {
+      const origin = path.join(f.repository, ".git", "offline-origin.git");
+      await f.git(
+        "clone", "--quiet", "--bare", "--no-hardlinks", f.repository, origin,
+      );
+      await f.git("config", "remote.origin.url", origin);
+      await f.git("config", "remote.origin.promisor", "true");
+      await f.git("config", "extensions.partialClone", "origin");
+      const blob = await f.git("rev-parse", "HEAD:index.ts");
+      const object = path.join(
+        f.repository, ".git", "objects", blob.slice(0, 2), blob.slice(2),
+      );
+      await rm(object);
+      const stateFiles = ["config", "index", "HEAD"];
+      const before = await Promise.all(
+        stateFiles.map((file) => readFile(path.join(f.repository, ".git", file))),
+      );
+      const packs = path.join(f.repository, ".git", "objects", "pack");
+      const packsBefore = await readdir(packs);
+      process.env.GIT_NO_LAZY_FETCH = "0";
+      await assert.rejects(
+        analyzeRepository({
+          repository: f.repository,
+          baseRef: f.baseRef,
+          headRef: f.baseRef,
+        }),
+        /Git operation failed/,
+      );
+      assert.deepEqual(
+        await Promise.all(
+          stateFiles.map((file) => readFile(path.join(f.repository, ".git", file))),
+        ),
+        before,
+      );
+      assert.deepEqual(await readdir(packs), packsBefore);
+      await assert.rejects(readFile(object), { code: "ENOENT" });
+      await assert.rejects(
+        readFile(path.join(f.repository, ".git", "FETCH_HEAD")),
+        { code: "ENOENT" },
+      );
+      assert.equal(
+        await readFile(path.join(f.repository, "index.ts"), "utf8"),
+        "export const value = 1;\n",
+      );
+    } finally {
+      if (previous === undefined) delete process.env.GIT_NO_LAZY_FETCH;
+      else process.env.GIT_NO_LAZY_FETCH = previous;
+      await f.cleanup();
+    }
+  },
+);
 
 test("oversized candidate sources omit their patches instead of reading unbounded content", async () => {
   const f = await fixture({ "large.ts": "export const before = 1;\n" });

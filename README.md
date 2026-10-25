@@ -5,16 +5,19 @@
 A local code-impact explorer paired with a real HTTP resilience lab. Analyze a Git comparison, inspect reverse dependency paths, then compare a reference application's baseline and candidate under controlled failures.
 
 ## Run
-Requires Node.js 22.13+ and Git.
+Requires Git and Node.js >=22.23.4 <23. On Windows x64, an older installed Node can bootstrap a verified project-local runtime:
 
 ```powershell
 cd 'D:\Gpt projs\Faultline'
+npm run setup:runtime
 npm ci
 npm run build
 npm start
 ```
 
 Open http://127.0.0.1:4317. Development: `npm run dev`, then http://127.0.0.1:5173.
+
+Skip `setup:runtime` if your installed Node already meets the requirement. Setup downloads the official Node 22.23.4 executable and verifies its SHA256 and Windows signature before installing it in ignored `.faultline/runtime/`. Project commands select a supported runtime and fail closed if none is available. Check it with `npm run runtime:check`. Setup leaves the machine-wide Node installation and PATH unchanged.
 
 ## Try the complete workflow
 1. Open the bundled checkout comparison in Impact Explorer. Its Git fixture is created locally on first startup.
@@ -24,6 +27,8 @@ Open http://127.0.0.1:4317. Development: `npm run dev`, then http://127.0.0.1:51
 5. Inspect measured traces and ledger evidence, open run history and export the JSON report.
 
 Other local Git repositories support read-only JavaScript/TypeScript analysis. Use a commit/tag/branch for each side, or `WORKTREE` for tracked current edits. Experiments intentionally execute only verified bundled source, not arbitrary imported repository code.
+
+The authenticated reference fixture uses `.faultline/demo-v2`; existing histories and the old fixture remain intact. Analyze the current bundled comparison to run new experiments. Older comparisons remain readable and exportable.
 
 ## Checks
 ```powershell

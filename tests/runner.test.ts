@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { once } from "node:events";
+import { request as httpRequest } from "node:http";
 import { fileURLToPath } from "node:url";
 import { ensureDemo } from "../packages/runner/src/demo.ts";
 import { runExperiment } from "../packages/runner/src/index.ts";
@@ -12,8 +15,16 @@ import type { DemoProject } from "../packages/shared/src/index.ts";
 
 let root: string;
 let demo: DemoProject;
+let legacyCommit: string;
 before(async () => {
   root = await mkdtemp(join(tmpdir(), "faultline-runner-"));
+  const legacy = join(root, ".faultline", "demo");
+  await mkdir(legacy, { recursive: true });
+  await git(legacy, ["init", "--quiet"]);
+  await writeFile(join(legacy, "notes.txt"), "Preserve legacy reference history");
+  await git(legacy, ["add", "--", "notes.txt"]);
+  await git(legacy, ["-c", "user.name=Faultline Test", "-c", "user.email=test@faultline.invalid", "-c", "commit.gpgsign=false", "-c", `core.hooksPath=${join(legacy, ".git", "disabled-hooks")}`, "commit", "--quiet", "-m", "Existing legacy reference"]);
+  legacyCommit = (await git(legacy, ["rev-parse", "HEAD"])).trim();
   demo = await ensureDemo(root);
 });
 after(async () => {
@@ -33,10 +44,84 @@ const execute = (
   });
 
 test("demo creation is idempotent and preserves existing user work", async () => {
+  assert.equal(demo.repository, join(root, ".faultline", "demo-v2"));
   const note = join(demo.repository, "notes.txt");
   await writeFile(note, "Keep this user file");
   assert.deepEqual(await ensureDemo(root), demo);
   assert.equal(await readFile(note, "utf8"), "Keep this user file");
+  const legacy = join(root, ".faultline", "demo");
+  assert.equal((await git(legacy, ["rev-parse", "HEAD"])).trim(), legacyCommit);
+  assert.equal(await readFile(join(legacy, "notes.txt"), "utf8"), "Preserve legacy reference history");
+});
+
+test("every fixture service requires a capability and rejects browser and non-JSON mutations", async (t) => {
+  const token = randomBytes(32).toString("hex");
+  for (const [service, endpoint] of [["checkout", "/checkout"], ["payments", "/charge"], ["inventory", "/reserve"]]) {
+    const child = spawn(process.execPath, [fileURLToPath(new URL(`../packages/runner/fixture/src/services/${service}.mjs`, import.meta.url))], {
+      env: { ...process.env, FAULTLINE_FIXTURE_TOKEN: token },
+      windowsHide: true,
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+    });
+    t.after(async () => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      const exited = once(child, "exit");
+      child.kill();
+      await exited;
+    });
+    const [startup] = await once(child, "message", { signal: AbortSignal.timeout(5000) });
+    const url = `http://127.0.0.1:${startup.port}`;
+    const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+    const body = JSON.stringify({ orderId: "order-0001", idempotencyKey: "order-0001" });
+    for (const path of ["/_state", "/unknown"]) {
+      assert.equal((await fetch(`${url}${path}`)).status, 403);
+      assert.equal((await fetch(`${url}${path}`, { headers: { authorization: `Bearer ${"0".repeat(64)}` } })).status, 403);
+    }
+    const denied = [
+      await fetch(`${url}${endpoint}`, { method: "POST", headers: { "content-type": "application/json" }, body }),
+      await fetch(`${url}${endpoint}`, { method: "POST", headers: { ...headers, origin: "https://foreign.invalid" }, body }),
+      await fetch(`${url}${endpoint}`, { method: "POST", headers: { ...headers, "content-type": "text/plain" }, body }),
+    ];
+    assert.deepEqual(denied.map((response) => response.status), [403, 403, 415]);
+    const foreignHostStatus = await new Promise((done, fail) => {
+      const request = httpRequest(`${url}${endpoint}`, { method: "POST", headers: { ...headers, host: "foreign.invalid" } }, (response) => {
+        response.resume();
+        done(response.statusCode);
+      });
+      request.once("error", fail);
+      request.end(body);
+    });
+    assert.equal(foreignHostStatus, 403);
+    for (const response of denied) assert.ok(!(await response.text()).includes(token));
+    const malformed = await fetch(`${url}${endpoint}`, { method: "POST", headers, body: `<${token}>` });
+    assert.equal(malformed.status, 400);
+    assert.deepEqual(await malformed.json(), { error: "Invalid JSON body" });
+    const state = await fetch(`${url}/_state`, { headers });
+    assert.equal(state.status, 200);
+    assert.deepEqual((await state.json()).traces, []);
+    assert.equal((await fetch(`${url}/_state`, { headers: { ...headers, origin: url } })).status, 200);
+    if (service !== "checkout") {
+      assert.equal((await fetch(`${url}${endpoint}`, { method: "POST", headers, body })).status, 200);
+      const evidence = await (await fetch(`${url}/_state`, { headers })).text();
+      assert.ok(!evidence.includes(token));
+      assert.equal(JSON.parse(evidence).traces.length, 1);
+    }
+  }
+});
+
+test("fixture startup fails closed without a valid capability", async () => {
+  for (const token of ["", "invalid-capability-do-not-log"]) {
+    const child = spawn(process.execPath, [fileURLToPath(new URL("../packages/runner/fixture/src/services/inventory.mjs", import.meta.url))], {
+      env: { ...process.env, FAULTLINE_FIXTURE_TOKEN: token },
+      windowsHide: true,
+      stdio: ["ignore", "ignore", "pipe", "ipc"],
+    });
+    let stderr = "";
+    child.stderr?.on("data", (chunk) => { stderr += chunk; });
+    const [code] = await once(child, "exit", { signal: AbortSignal.timeout(5000) });
+    assert.equal(code, 1);
+    assert.match(stderr, /A fixture capability token is required/);
+    if (token) assert.ok(!stderr.includes(token));
+  }
 });
 
 test("healthy control runs real services without duplicate charges", async () => {
@@ -151,6 +236,7 @@ test("maximum 100-request latency workload completes and removes both snapshots"
 });
 
 test("fixture service exits when its coordinator crashes and the IPC pipe closes", async () => {
+  const token = randomBytes(32).toString("hex");
   const service = fileURLToPath(
     new URL(
       "../packages/runner/fixture/src/services/inventory.mjs",
@@ -169,7 +255,7 @@ test("fixture service exits when its coordinator crashes and the IPC pipe closes
   `,
     ],
     {
-      env: { ...process.env, FAULTLINE_TEST_SERVICE: service },
+      env: { ...process.env, FAULTLINE_TEST_SERVICE: service, FAULTLINE_FIXTURE_TOKEN: token },
       windowsHide: true,
       stdio: ["ignore", "ignore", "pipe", "ipc"],
     },
@@ -199,7 +285,7 @@ test("fixture service exits when its coordinator crashes and the IPC pipe closes
     );
     servicePid = startup.pid;
     assert.equal(
-      (await fetch(`http://127.0.0.1:${startup.port}/_state`)).status,
+      (await fetch(`http://127.0.0.1:${startup.port}/_state`, { headers: { authorization: `Bearer ${token}` } })).status,
       200,
     );
     const exited = new Promise<void>((done) =>

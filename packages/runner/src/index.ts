@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import {
@@ -136,6 +137,7 @@ async function runVariant(
   files: Map<string, string>,
   input: ExperimentInput,
   emit: (phase: string, message: string) => void,
+  token: string,
 ): Promise<VariantResult> {
   const workRoot = resolve(input.workDir);
   await mkdir(workRoot, { recursive: true });
@@ -160,7 +162,7 @@ async function runVariant(
     const inventory = await startService(
       directory,
       "inventory",
-      {},
+      { FAULTLINE_FIXTURE_TOKEN: token },
       children,
       controller,
       () => stopping,
@@ -168,7 +170,7 @@ async function runVariant(
     const payments = await startService(
       directory,
       "payments",
-      { SCENARIO: input.scenario },
+      { SCENARIO: input.scenario, FAULTLINE_FIXTURE_TOKEN: token },
       children,
       controller,
       () => stopping,
@@ -176,7 +178,7 @@ async function runVariant(
     const checkout = await startService(
       directory,
       "checkout",
-      { INVENTORY_URL: inventory, PAYMENTS_URL: payments },
+      { INVENTORY_URL: inventory, PAYMENTS_URL: payments, FAULTLINE_FIXTURE_TOKEN: token },
       children,
       controller,
       () => stopping,
@@ -198,7 +200,7 @@ async function runVariant(
           const start = performance.now();
           const response = await fetch(`${checkout}/checkout`, {
             method: "POST",
-            headers: { "content-type": "application/json" },
+            headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
             body: JSON.stringify({ orderId: requestId }),
             signal: AbortSignal.any([
               controller.signal,
@@ -215,6 +217,7 @@ async function runVariant(
     const states = await Promise.all(
       [checkout, inventory, payments].map(async (url) => {
         const response = await fetch(`${url}/_state`, {
+          headers: { authorization: `Bearer ${token}` },
           signal: AbortSignal.any([
             controller.signal,
             AbortSignal.timeout(2000),
@@ -298,17 +301,20 @@ export async function runExperiment(
     `Pinned baseline ${baselineSnapshot.commit.slice(0, 8)} and candidate ${candidateSnapshot.commit.slice(0, 8)}. The same order IDs and per-order fault rule apply to both.`,
   );
   try {
+    const token = randomBytes(32).toString("hex");
     const baseline = await runVariant(
       "baseline",
       baselineSnapshot.files,
       input,
       emit,
+      token,
     );
     const candidate = await runVariant(
       "candidate",
       candidateSnapshot.files,
       input,
       emit,
+      token,
     );
     const findings: Finding[] = [];
     let verdict: ExperimentResult["verdict"] = "no-regression";

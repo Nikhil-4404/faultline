@@ -55,6 +55,7 @@ async function git(
       [
         "--no-pager",
         "--no-optional-locks",
+        "--no-lazy-fetch",
         "-c",
         "core.fsmonitor=false",
         "-c",
